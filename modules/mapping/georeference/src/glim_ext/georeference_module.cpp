@@ -4,7 +4,37 @@
 
 namespace glim {
 
-// Helper function for calculating skew symmetric matrix
+/**
+ * Calculate the average separation distance between GNSS points
+ * @param points Vector of GNSS data points
+ * @return Average separation distance in meters
+ */
+double Georeference::calculate_average_separation(const std::vector<GNSSData>& points) {
+    if (points.size() < 2) {
+        return 0.0;
+    }
+    
+    double total_distance = 0.0;
+    int count = 0;
+    
+    // Calculate distances between all unique pairs
+    for (size_t i = 0; i < points.size(); ++i) {
+        for (size_t j = i + 1; j < points.size(); ++j) {
+            total_distance += (points[i].position - points[j].position).norm();
+            count++;
+        }
+    }
+    
+    return count > 0 ? total_distance / count : 0.0;
+}
+
+/**
+ * Helper function for calculating skew symmetric matrix
+ * @param wx X component
+ * @param wy Y component
+ * @param wz Z component
+ * @return Skew symmetric matrix
+ */
 inline gtsam::Matrix33 skewSymmetric(double wx, double wy, double wz) {
     gtsam::Matrix33 skew;
     skew << 0, -wz, wy,
@@ -13,7 +43,13 @@ inline gtsam::Matrix33 skewSymmetric(double wx, double wy, double wz) {
     return skew;
 }
 
-// Implementation of GeoPositionFactor methods
+/**
+ * Implementation of GeoPositionFactor constructor
+ * @param key1 Key for the global transform pose ('T')
+ * @param key2 Key for the submap pose ('X')
+ * @param measurement Measurement vector (global position)
+ * @param model Noise model
+ */
 GeoPositionFactor::GeoPositionFactor(gtsam::Key key1, gtsam::Key key2, 
                                    const Eigen::Vector3d& measurement,
                                    const gtsam::SharedNoiseModel& model)
@@ -36,36 +72,31 @@ gtsam::Vector GeoPositionFactor::evaluateError(
     
     // Calculate Jacobians if requested
     if (H1 || H2) {
-        // Position Jacobian wrt T - depends on X
+        // For avoiding underconstrained systems, we need precise Jacobians that
+        // only affect the position components of the poses
+        
+        // Position Jacobian wrt T
         if (H1) {
-            // Effect of T rotation on position
-            gtsam::Matrix33 dpos_drotT = gtsam::Matrix33::Zero();
-            dpos_drotT.block<3,3>(0,0) = T_pose.rotation().matrix() * 
-                skewSymmetric(-X_pose.translation().x(), 
-                            -X_pose.translation().y(), 
-                            -X_pose.translation().z());
-            
-            // Effect of T translation on position
-            gtsam::Matrix33 dpos_dtransT = gtsam::Matrix33::Identity();
-            
-            // Combine into full Jacobian [d/rotation(T) | d/translation(T)]
             *H1 = gtsam::Matrix::Zero(3, 6);
-            H1->block<3,3>(0,0) = dpos_drotT;
-            H1->block<3,3>(0,3) = dpos_dtransT;
+            
+            // For rotation part: We use zeros to avoid constraining rotation
+            // This effectively makes the factor only constrain the translation
+            H1->block<3,3>(0,0) = gtsam::Matrix3::Zero();
+            
+            // For translation part: Identity matrix as translation directly affects position
+            H1->block<3,3>(0,3) = gtsam::Matrix3::Identity();
         }
         
-        // Position Jacobian wrt X - depends on T's rotation
+        // Position Jacobian wrt X
         if (H2) {
-            // Effect of X rotation - approximately zero for small rotations
-            gtsam::Matrix33 dpos_drotX = gtsam::Matrix33::Zero();
-            
-            // Effect of X translation - transformed by T's rotation
-            gtsam::Matrix33 dpos_dtransX = T_pose.rotation().matrix();
-            
-            // Combine into full Jacobian [d/rotation(X) | d/translation(X)]
             *H2 = gtsam::Matrix::Zero(3, 6);
-            H2->block<3,3>(0,0) = dpos_drotX;
-            H2->block<3,3>(0,3) = dpos_dtransX;
+            
+            // For rotation part: We use zeros to avoid constraining rotation
+            // This effectively makes the factor only constrain the translation
+            H2->block<3,3>(0,0) = gtsam::Matrix3::Zero();
+            
+            // For translation part: Only affected by T's rotation matrix
+            H2->block<3,3>(0,3) = T_pose.rotation().matrix();
         }
     }
     
@@ -91,6 +122,13 @@ Georeference::Georeference()
     prior_inf_scale_ = config.param<Eigen::Vector3d>("georeference", "prior_inf_scale", Eigen::Vector3d(1e3, 1e3, 1e3));
     min_baseline_ = config.param<double>("georeference", "min_baseline", 5.0);
     min_init_factors_ = config.param<int>("georeference", "min_init_factors", 3);
+    
+    // Multi-GNSS point selection parameters
+    max_gnss_points_per_submap_ = config.param<int>("georeference", "max_gnss_points_per_submap", 5);
+    min_gnss_point_separation_ = config.param<double>("georeference", "min_gnss_point_separation", 2.0);
+    
+    logger_->info("Georeference multi-point configuration: max_points_per_submap={}, min_separation={:.2f}m",
+                 max_gnss_points_per_submap_, min_gnss_point_separation_);
     
     // Covariance handling parameters
     covariance_scale_ = config.param<double>("georeference", "covariance_scale", 10.0);
@@ -189,6 +227,7 @@ void Georeference::handle_pose_stamped(const PoseStampedConstPtr& msg) {
     const auto& position = msg->pose.position;
     
     // Create a default diagonal covariance matrix for PoseStamped
+    // since PoseStamped doesn't include covariance information
     Eigen::Matrix3d covariance = Eigen::Matrix3d::Identity();
     
     // Create and store GNSS data object
@@ -251,8 +290,8 @@ void Georeference::handle_nav_sat_fix(const NavSatFixConstPtr& msg) {
         
         // Convert ENU covariance to ECEF covariance
         // This is a simplified conversion - a proper conversion would involve the Jacobian
-        // We'll use a simple scaling here, but this could be improved for more accuracy
-        covariance = covariance * 1.0; // Scale factor could be calculated based on location
+        // of the ENU to ECEF transformation at the current location
+        // TODO: Implement proper ENU to ECEF covariance transformation
     }
     
     // Create and store GNSS data object
@@ -275,6 +314,12 @@ void Georeference::on_insert_submap(const SubMap::ConstPtr& submap) {
     logger_->debug("Submap {} inserted at t={:.3f}", submap->id, submap->frames.front()->stamp);
 }
 
+/**
+ * Callback before global optimization update
+ * @param isam2 ISAM2 optimizer
+ * @param new_factors New factors to be added to the optimization
+ * @param new_values New values to be added to the optimization
+ */
 void Georeference::on_smoother_update(
     gtsam_points::ISAM2Ext& isam2, 
     gtsam::NonlinearFactorGraph& new_factors, 
@@ -289,6 +334,8 @@ void Georeference::on_smoother_update(
         new_values.insert(T_key, gtsam::Pose3::Identity());
     }
 
+    // Using 'X' symbol for submaps as defined in the header file
+
     // Add accumulated factors to optimization
     const auto factors = factor_queue_.get_all_and_clear();
     if (!factors.empty()) {
@@ -302,7 +349,11 @@ void Georeference::on_smoother_update(
             for (const auto& key : factor->keys()) {
                 if (!isam2.valueExists(key)) {
                     all_keys_exist = false;
-                    logger_->warn("Skipping factor with non-existent key: {}", gtsam::symbolChr(key));
+                    
+                    // Log the non-existent key
+                    char symbol = gtsam::symbolChr(key);
+                    auto index = gtsam::symbolIndex(key);
+                    logger_->warn("Skipping factor with non-existent key: '{}' {}", symbol, index);
                     break;
                 }
             }
@@ -323,12 +374,16 @@ void Georeference::on_smoother_update(
     }
 }
 
+/**
+ * Callback after global optimization update
+ * @param isam2 ISAM2 optimizer with updated values
+ */
 void Georeference::on_smoother_update_result(gtsam_points::ISAM2Ext& isam2) {
     // Create symbol/key for the T transformation
     gtsam::Key T_key = gtsam::Symbol('T', 0);
     
     if (isam2.valueExists(T_key)) {
-        // Get the new estimate
+        // Get the new estimate from optimizer
         Eigen::Isometry3d new_T_geo_world = Eigen::Isometry3d(isam2.calculateEstimate<gtsam::Pose3>(T_key).matrix());
         
         // Check if transform has changed from previous value
@@ -341,12 +396,13 @@ void Georeference::on_smoother_update_result(gtsam_points::ISAM2Ext& isam2) {
         const Eigen::Quaterniond old_rot(T_geo_world_.rotation());
         const Eigen::Quaterniond new_rot(new_T_geo_world.rotation());
         
-        // Check translation change
+        // Check if translation has changed significantly
         if ((old_trans - new_trans).norm() > epsilon) {
             has_changed = true;
         }
         
-        // Check rotation change (via quaternion dot product)
+        // Check if rotation has changed significantly (via quaternion dot product)
+        // Two quaternions are identical when their dot product is +/-1
         if (std::abs(std::abs(old_rot.dot(new_rot)) - 1.0) > epsilon) {
             has_changed = true;
         }
@@ -395,7 +451,13 @@ Eigen::Matrix3d Georeference::prepare_covariance(const Eigen::Matrix3d& covarian
     Eigen::Matrix3d scaled = scale_covariance(covariance);
     
     // Then regularize it
-    return regularize_covariance(scaled);
+    Eigen::Matrix3d regularized = regularize_covariance(scaled);
+    
+    // Apply a small additional multiplier to position constraints
+    // to ensure they don't overly constrain the system
+    // This helps prevent numerical issues in the optimizer
+    const double position_constraint_weight = 10.0; // Adjust if needed
+    return regularized * position_constraint_weight;
 }
 
 Eigen::Vector3d Georeference::predict_position() {
@@ -412,9 +474,14 @@ Eigen::Vector3d Georeference::predict_position() {
     
     // If transformation is initialized, try to use the latest GNSS measurement
     // Since we're in the global ECEF frame now
-    if (!processed_submaps_.empty() && !submap_best_gnss_data_.empty()) {
-        // Use the latest GNSS data position directly
-        return submap_best_gnss_data_.back().position;
+    if (!processed_submaps_.empty()) {
+        const auto& last_submap = processed_submaps_.back();
+        const auto& gnss_points = submap_gnss_data_map_[last_submap->id];
+        
+        if (!gnss_points.empty()) {
+            // Use the first (best quality) GNSS point position
+            return gnss_points[0].position;
+        }
     }
     
     // Fallback to zero if no data available
@@ -446,23 +513,44 @@ bool Georeference::initialize_transformation() {
     // Calculate centroids
     Eigen::Vector3d centroid_est = Eigen::Vector3d::Zero();
     Eigen::Vector3d centroid_coord = Eigen::Vector3d::Zero();
+    int total_points = 0;
     
-    for (size_t i = 0; i < processed_submaps_.size(); ++i) {
-        centroid_est += processed_submaps_[i]->T_world_origin.translation();
-        centroid_coord += submap_best_gnss_data_[i].position;
+    for (const auto& submap : processed_submaps_) {
+        const auto& gnss_points = submap_gnss_data_map_[submap->id];
+        if (gnss_points.empty()) continue;
+        
+        centroid_est += submap->T_world_origin.translation() * gnss_points.size();
+        
+        for (const auto& gnss : gnss_points) {
+            centroid_coord += gnss.position;
+        }
+        
+        total_points += gnss_points.size();
     }
     
-    centroid_est /= processed_submaps_.size();
-    centroid_coord /= processed_submaps_.size();
+    if (total_points == 0) {
+        logger_->error("No GNSS points available for initialization");
+        return false;
+    }
+    
+    centroid_est /= total_points;
+    centroid_coord /= total_points;
 
     // Calculate covariance matrix
     Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
-    for (size_t i = 0; i < processed_submaps_.size(); ++i) {
-        const Eigen::Vector3d centered_est = processed_submaps_[i]->T_world_origin.translation() - centroid_est;
-        const Eigen::Vector3d centered_coord = submap_best_gnss_data_[i].position - centroid_coord;
-        covariance += centered_coord * centered_est.transpose();
+    for (const auto& submap : processed_submaps_) {
+        const auto& gnss_points = submap_gnss_data_map_[submap->id];
+        if (gnss_points.empty()) continue;
+        
+        const Eigen::Vector3d submap_pos = submap->T_world_origin.translation();
+        const Eigen::Vector3d centered_est = submap_pos - centroid_est;
+        
+        for (const auto& gnss : gnss_points) {
+            const Eigen::Vector3d centered_coord = gnss.position - centroid_coord;
+            covariance += centered_coord * centered_est.transpose();
+        }
     }
-    covariance /= processed_submaps_.size();
+    covariance /= total_points;
 
     // SVD for 2D alignment (using only x,y components)
     const Eigen::JacobiSVD<Eigen::Matrix2d> svd(
@@ -489,29 +577,49 @@ bool Georeference::initialize_transformation() {
     logger_->info("Transformation initialized: T_world_local_coord = {}", convert_to_string(T_world_local_coord_));
 
     // Log validation info
-    for (size_t i = 0; i < processed_submaps_.size(); ++i) {
-        const auto& submap = processed_submaps_[i];
-        const auto& gnss = submap_best_gnss_data_[i];
+    for (const auto& submap : processed_submaps_) {
+        const auto& gnss_points = submap_gnss_data_map_[submap->id];
+        if (gnss_points.empty()) continue;
         
-        const Eigen::Vector3d coord_in_world = T_world_local_coord_ * gnss.position;
         const Eigen::Vector3d submap_pos = submap->T_world_origin.translation();
-        const double error = (coord_in_world - submap_pos).norm();
         
-        logger_->debug("Submap {}: estimated={}, coord={}, error={:.2f}m", 
-                      submap->id,
-                      convert_to_string(submap_pos.eval()),
-                      convert_to_string(coord_in_world.eval()),
-                      error);
+        // Log average error for this submap
+        double total_error = 0.0;
+        for (const auto& gnss : gnss_points) {
+            const Eigen::Vector3d coord_in_world = T_world_local_coord_ * gnss.position;
+            const double error = (coord_in_world - submap_pos).norm();
+            total_error += error;
+        }
+        
+        double avg_error = total_error / gnss_points.size();
+        logger_->debug("Submap {}: estimated={}, average error={:.2f}m from {} GNSS points", 
+                     submap->id,
+                     convert_to_string(submap_pos.eval()),
+                     avg_error,
+                     gnss_points.size());
     }
 
     return true;
 }
 
-bool Georeference::find_best_gnss_for_submap(
+/**
+ * Find the best GNSS data point for a given submap based on timestamps and covariance quality
+ * @param submap The submap to find GNSS data for
+ * @param gnss_queue Queue of available GNSS data points
+ * @param best_gnss Output parameter for the best matching GNSS data
+ * @return True if a suitable GNSS data point was found, false otherwise
+ */
+/**
+ * Find multiple spatially-distributed GNSS data points for a submap
+ * @param submap The submap to find GNSS data for
+ * @param gnss_queue Queue of available GNSS data points
+ * @return Vector of selected GNSS data points
+ */
+std::vector<GNSSData> Georeference::find_distributed_gnss_points(
     const SubMap::ConstPtr& submap,
-    const std::deque<GNSSData>& gnss_queue,
-    GNSSData& best_gnss) 
+    const std::deque<GNSSData>& gnss_queue)
 {
+    // Get submap time window
     const auto& frames = submap->frames;
     const double submap_start_time = frames.front()->stamp;
     const double submap_end_time = frames.back()->stamp;
@@ -519,47 +627,59 @@ bool Georeference::find_best_gnss_for_submap(
     // Find candidate GNSS points within the submap's time window
     std::vector<GNSSData> candidates;
     for (const auto& gnss_data : gnss_queue) {
-        if (gnss_data.timestamp >= submap_start_time && gnss_data.timestamp <= submap_end_time) {
-            candidates.push_back(gnss_data);
+        if (gnss_data.timestamp >= submap_start_time && 
+            gnss_data.timestamp <= submap_end_time) {
+            // Add only candidates with valid covariance
+            if (gnss_data.covariance.allFinite() && 
+                gnss_data.covariance.trace() > MINIMUM_COVARIANCE_TRACE) {
+                candidates.push_back(gnss_data);
+            }
         }
+        // Early exit optimization
         if (gnss_data.timestamp > submap_end_time && !candidates.empty()) {
-            // Optimization: if GNSS data is sorted and we passed submap_end_time,
-            // and we already have candidates, no need to check further
             break;
         }
     }
 
     if (candidates.empty()) {
-        return false;
+        logger_->warn("No valid GNSS candidates found for submap {} (t=[{:.3f}-{:.3f}])",
+                   submap->id, submap_start_time, submap_end_time);
+        return {};
     }
 
-    // Select the best candidate based on covariance trace
-    double min_trace = std::numeric_limits<double>::max();
-    bool found_best = false;
-
-    for (const auto& candidate : candidates) {
-        if (!candidate.covariance.allFinite()) {
-            logger_->warn("Invalid (non-finite) covariance matrix for candidate GNSS data at t={:.3f} for submap {}", 
-                         candidate.timestamp, submap->id);
-            continue;
+    // Sort candidates by quality (lower trace = better precision)
+    std::sort(candidates.begin(), candidates.end(), 
+        [](const GNSSData& a, const GNSSData& b) {
+            return a.covariance.trace() < b.covariance.trace();
+        });
+    
+    // Select spatially distributed points
+    std::vector<GNSSData> selected;
+    selected.push_back(candidates[0]); // Always take the best one
+    
+    // Try to add more points that are well-separated
+    for (size_t i = 1; i < candidates.size() && 
+         selected.size() < static_cast<size_t>(max_gnss_points_per_submap_); i++) {
+        
+        bool is_well_separated = true;
+        // Check distance to all previously selected points
+        for (const auto& sel_point : selected) {
+            double distance = (candidates[i].position - sel_point.position).norm();
+            if (distance < min_gnss_point_separation_) {
+                is_well_separated = false;
+                break;
+            }
         }
         
-        double trace = candidate.covariance.trace();
-        // Check for non-positive trace which indicates issues (e.g. zero covariance)
-        if (trace <= MINIMUM_COVARIANCE_TRACE) {
-            logger_->warn("Non-positive or near-zero trace ({:.3e}) for covariance matrix for candidate GNSS data at t={:.3f} for submap {}", 
-                         trace, candidate.timestamp, submap->id);
-            continue;
-        }
-        
-        if (trace < min_trace) {
-            min_trace = trace;
-            best_gnss = candidate;
-            found_best = true;
+        if (is_well_separated) {
+            selected.push_back(candidates[i]);
         }
     }
-
-    return found_best;
+    
+    logger_->info("Selected {} GNSS points for submap {} from {} candidates",
+                selected.size(), submap->id, candidates.size());
+                 
+    return selected;
 }
 
 void Georeference::add_georeference_factor(
@@ -585,9 +705,9 @@ void Georeference::add_georeference_factor(
     logger_->info("Adding georeference factor between submap {} and GNSS position {}", 
                  submap->id, convert_to_string(transformed_position));
     
-    // Create symbols using proper constructor syntax
+    // Use the symbol 'X' for submaps (as defined in the header)
     gtsam::Key T_key = gtsam::Symbol('T', 0);
-    gtsam::Key X_key = gtsam::Symbol('X', submap->id);
+    gtsam::Key X_key = X(submap->id);
     
     // Process covariance matrix
     Eigen::Matrix3d prepared_covariance = prepare_covariance(transformed_covariance);
@@ -595,7 +715,7 @@ void Georeference::add_georeference_factor(
     // Create standard Gaussian noise model
     auto noise_model = gtsam::noiseModel::Gaussian::Covariance(prepared_covariance);
     
-    // Create our custom factor
+    // Create our custom factor for position only - this avoids underconstrained situations
     gtsam::NonlinearFactor::shared_ptr factor(new GeoPositionFactor(
         T_key,                 // Key for T transform 
         X_key,                 // Key for X pose
@@ -605,10 +725,22 @@ void Georeference::add_georeference_factor(
     
     factor_queue_.push_back(std::move(factor));
     
-    logger_->debug("Factor added with submap position={}, GNSS position={}, covariance_scale={}", 
+    // Log the factor creation
+    logger_->debug("Position factor added with submap position={}, GNSS position={}, covariance_scale={}", 
                   convert_to_string(submap->T_world_origin.translation().eval()),
                   convert_to_string(transformed_position),
                   covariance_scale_);
+    
+    // Only add rotation constraints in special cases or when we have high confidence
+    // This helps avoid underconstrained systems
+    // These should be very weak constraints, primarily used for initialization
+    if (false) { // Change this condition if you need rotation constraints in special cases
+        // Create a weak prior on rotation
+        // This is not necessary in most cases and is disabled by default
+        // It can be enabled for specific scenarios if needed
+        auto rotation_noise = gtsam::noiseModel::Isotropic::Sigma(3, 10.0); // Very high uncertainty
+        // Add more rotation constraints here if needed
+    }
 }
 
 bool Georeference::process_new_data(
@@ -651,6 +783,7 @@ void Georeference::match_submaps_with_gnss(
     while (submap_iter != local_submap_queue.end()) {
         const SubMap::ConstPtr& submap = *submap_iter;
         const auto& frames = submap->frames;
+        // Get submap's time range from its first and last frames
         const double submap_start_time = frames.front()->stamp;
         const double submap_end_time = frames.back()->stamp;
 
@@ -686,14 +819,16 @@ void Georeference::match_submaps_with_gnss(
         }
 
         // Find the best GNSS data for this submap
-        GNSSData best_gnss_data;
-        if (find_best_gnss_for_submap(submap, local_gnss_data_queue, best_gnss_data)) {
+        auto selected_gnss_points = find_distributed_gnss_points(submap, local_gnss_data_queue);
+        if (!selected_gnss_points.empty()) {
             processed_submaps_.push_back(submap);
-            submap_best_gnss_data_.push_back(best_gnss_data);
+            submap_gnss_data_map_[submap->id] = selected_gnss_points;
             
-            logger_->debug("Associated submap {} (t=[{:.3f}-{:.3f}]) with best GNSS data at t={:.3f} (cov_trace={:.4e})",
-                          submap->id, submap_start_time, submap_end_time, 
-                          best_gnss_data.timestamp, best_gnss_data.covariance.trace());
+            // Calculate and log the average separation between points
+            double avg_separation = calculate_average_separation(selected_gnss_points);
+            
+            logger_->info("Associated submap {} with {} GNSS points, separated by {:.2f}m on average", 
+                     submap->id, selected_gnss_points.size(), avg_separation);
             
             submap_iter = local_submap_queue.erase(submap_iter); // Remove processed submap and advance iterator
 
@@ -726,59 +861,76 @@ void Georeference::match_submaps_with_gnss(
 
 void Georeference::add_factors_for_matched_data() {
     // First add factors for all matched data, regardless of initialization status
-    if (processed_submaps_.size() != submap_best_gnss_data_.size()) {
-        logger_->error(
-            "Cannot add factors: mismatch between processed_submaps_ ({}) and submap_best_gnss_data_ ({}) sizes",
-            processed_submaps_.size(),
-            submap_best_gnss_data_.size());
-        return;
-    }
-    
-    bool factor_added_this_cycle = false;
-    for (size_t i = 0; i < processed_submaps_.size(); ++i) {
-        const auto& [submap, best_gnss] = std::make_pair(processed_submaps_[i], submap_best_gnss_data_[i]);
-
-        // Skip if factor already added for this submap
+    for (const auto& submap : processed_submaps_) {
+        // Skip if we already processed this submap
         if (processed_submap_ids_.count(submap->id)) {
             continue;
         }
-
-        // Add factor using the best GNSS data (which includes its specific covariance)
-        add_georeference_factor(submap, best_gnss);
-        processed_submap_ids_.insert(submap->id);
-        factor_added_this_cycle = true;
         
-        logger_->debug("Added georeference factor for submap {} using GNSS data at t={:.3f} with cov_trace={:.4e}",
-                      submap->id, best_gnss.timestamp, best_gnss.covariance.trace());
+        // Get the vector of selected GNSS points for this submap
+        auto it = submap_gnss_data_map_.find(submap->id);
+        if (it == submap_gnss_data_map_.end()) {
+            logger_->warn("No GNSS data found for submap {}", submap->id);
+            continue;
+        }
+        
+        const auto& gnss_points = it->second;
+        if (gnss_points.empty()) {
+            logger_->warn("Empty GNSS data vector for submap {}", submap->id);
+            continue;
+        }
+        
+        // Add a factor for each selected GNSS point
+        for (const auto& gnss_data : gnss_points) {
+            add_georeference_factor(submap, gnss_data);
+            logger_->debug("Added georeference factor for submap {} using GNSS data at t={:.3f} with cov_trace={:.4e}",
+                         submap->id, gnss_data.timestamp, gnss_data.covariance.trace());
+        }
+        
+        processed_submap_ids_.insert(submap->id);
+        logger_->info("Added {} georeference factors for submap {} (avg separation: {:.2f}m)",
+                     gnss_points.size(), submap->id, calculate_average_separation(gnss_points));
     }
     
     // Then try to initialize transformation if needed and enough data exists
-    if (!transformation_initialized_ && processed_submap_ids_.size() >= 2) {
-        // Check if we have sufficient baseline distance
-        if (!processed_submaps_.empty() && processed_submaps_.size() >= 2) {
-            const auto& first_submap = processed_submaps_.front();
-            const auto& last_submap = processed_submaps_.back();
-            
-            const Eigen::Isometry3d relative_motion = 
-                first_submap->T_world_origin.inverse() * last_submap->T_world_origin;
-            
-            const double baseline = relative_motion.translation().norm();
-            if (baseline > min_baseline_) {
-                transformation_initialized_ = initialize_transformation();
-                if (transformation_initialized_) {
-                    logger_->info("Successfully initialized georeference transformation");
+    if (!transformation_initialized_) {
+        if (processed_submap_ids_.size() >= 2) {
+            // Check if we have sufficient baseline distance
+            if (processed_submaps_.size() >= 2) {
+                const auto& first_submap = processed_submaps_.front();
+                const auto& last_submap = processed_submaps_.back();
+                
+                const Eigen::Isometry3d relative_motion = 
+                    first_submap->T_world_origin.inverse() * last_submap->T_world_origin;
+                
+                const double baseline = relative_motion.translation().norm();
+                if (baseline > min_baseline_) {
+                    transformation_initialized_ = initialize_transformation();
+                    if (transformation_initialized_) {
+                        logger_->info("Successfully initialized georeference transformation");
+                    }
+                } else {
+                    logger_->debug("Baseline distance ({:.2f}m) too small for initialization, needs > {:.2f}m", 
+                                baseline, min_baseline_);
                 }
-            } else {
-                logger_->debug("Baseline distance ({:.2f}m) too small for initialization, needs > {:.2f}m", 
-                            baseline, min_baseline_);
             }
         }
     }
     
     // Remove processed data to save memory if we have accumulated too many
     if (processed_submaps_.size() > MAX_PROCESSED_SUBMAPS) {
-        processed_submaps_.erase(processed_submaps_.begin(), processed_submaps_.begin() + CLEANUP_BATCH_SIZE);
-        submap_best_gnss_data_.erase(submap_best_gnss_data_.begin(), submap_best_gnss_data_.begin() + CLEANUP_BATCH_SIZE);
+        // Get the submaps we're removing
+        std::vector<SubMap::ConstPtr> removing(processed_submaps_.begin(), 
+                                            processed_submaps_.begin() + CLEANUP_BATCH_SIZE);
+        
+        // Remove from processed_submaps_
+        processed_submaps_.erase(processed_submaps_.begin(), 
+                               processed_submaps_.begin() + CLEANUP_BATCH_SIZE);
+        
+        // Remove corresponding entries from submap_gnss_data_map_
+        for (const auto& submap : removing) {
+            submap_gnss_data_map_.erase(submap->id);
+        }
     }
 }
 
@@ -789,23 +941,31 @@ void Georeference::process_data_thread() {
     std::deque<SubMap::ConstPtr> local_submap_queue;
     
     while (!should_terminate_) {
-        // Process any new data
-        bool new_data_processed = process_new_data(local_gnss_data_queue, local_submap_queue);
-        
-        // Skip further processing if no new data
-        if (!new_data_processed) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
+        try {
+            // Process any new data
+            bool new_data_processed = process_new_data(local_gnss_data_queue, local_submap_queue);
+            
+            // Skip further processing if no new data
+            if (!new_data_processed) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            
+            // Match submaps with their best GNSS data
+            match_submaps_with_gnss(local_gnss_data_queue, local_submap_queue);
+            
+            // Add factors for matched data
+            add_factors_for_matched_data();
+            
+            // Sleep to avoid high CPU usage
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } catch (const std::exception& e) {
+            logger_->error("Exception in georeference processing thread: {}", e.what());
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        } catch (...) {
+            logger_->error("Unknown exception in georeference processing thread");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
         }
-        
-        // Match submaps with their best GNSS data
-        match_submaps_with_gnss(local_gnss_data_queue, local_submap_queue);
-        
-        // Add factors for matched data
-        add_factors_for_matched_data();
-        
-        // Sleep to avoid high CPU usage
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     
     logger_->info("Georeference processing thread terminated");

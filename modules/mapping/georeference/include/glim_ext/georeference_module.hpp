@@ -1,16 +1,23 @@
+#pragma once
+
 #include <deque>
 #include <atomic>
 #include <thread>
-#include <numeric>
+#include <memory>
+#include <string>
+#include <unordered_set>
 #include <Eigen/Core>
-
-#define GLIM_ROS2
+#include <Eigen/Geometry>
 
 #include <boost/format.hpp>
 #include <glim/mapping/callbacks.hpp>
 #include <glim/util/logging.hpp>
 #include <glim/util/concurrent_vector.hpp>
+#include <glim/util/convert_to_string.hpp>
+#include <glim_ext/util/config_ext.hpp>
+#include <glim_ext/geodetic.hpp>
 
+// ROS version-specific includes
 #ifdef GLIM_ROS2
 #include <glim/util/extension_module_ros2.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
@@ -28,294 +35,300 @@ using OdometryConstPtr = nav_msgs::msg::Odometry::ConstSharedPtr;
 using NavSatFix = sensor_msgs::msg::NavSatFix;
 using NavSatFixConstPtr = sensor_msgs::msg::NavSatFix::ConstSharedPtr;
 
+// ROS2 timestamp conversion
 template <typename Stamp>
 double to_sec(const Stamp& stamp) {
   return stamp.sec + stamp.nanosec / 1e9;
 }
 #else
 #include <glim/util/extension_module_ros.hpp>
-#include <geometry_msgs/PoseWithCovarianceStamped.hpp>
+#include <geometry_msgs/PoseWithCovarianceStamped.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <nav_msgs/Odometry.h>
+#include <sensor_msgs/NavSatFix.h>
 
 using ExtensionModuleBase = glim::ExtensionModuleROS;
+using PoseWithCovarianceStamped = geometry_msgs::PoseWithCovarianceStamped;
+using PoseWithCovarianceStampedConstPtr = geometry_msgs::PoseWithCovarianceStampedConstPtr;
+using PoseStamped = geometry_msgs::PoseStamped;
+using PoseStampedConstPtr = geometry_msgs::PoseStampedConstPtr;
+using Odometry = nav_msgs::Odometry;
+using OdometryConstPtr = nav_msgs::OdometryConstPtr;
+using NavSatFix = sensor_msgs::NavSatFix;
+using NavSatFixConstPtr = sensor_msgs::NavSatFixConstPtr;
+
+// ROS1 timestamp conversion
+template <typename Stamp>
+double to_sec(const Stamp& stamp) {
+  return stamp.toSec();
+}
 #endif
 
+// GTSAM includes
 #include <spdlog/spdlog.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/geometry/Pose3.h>
+#include <gtsam/geometry/Rot3.h>
 #include <gtsam/slam/PoseTranslationPrior.h>
 #include <gtsam/nonlinear/NonlinearFactor.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
-#include <gtsam/nonlinear/ExpressionFactor.h>
-#include <gtsam/nonlinear/Expression.h>
-
-#include <glim/util/logging.hpp>
-#include <glim/util/convert_to_string.hpp>
-#include <glim_ext/util/config_ext.hpp>
-#include <glim_ext/geodetic.hpp>
 
 namespace glim {
 
-struct GNSSData {
-  double stamp;
-  Eigen::Vector3d pos;
-  Eigen::Vector3d cov;
-};
+// Symbol shorthand for GTSAM factors - using Symbol class directly
+using gtsam::symbol_shorthand::X;  // For poses
 
-using gtsam::symbol_shorthand::X;
+// Constants for numerical stability and optimization
+constexpr double MINIMUM_COVARIANCE_TRACE = 1e-9;
+constexpr size_t MAX_PROCESSED_SUBMAPS = 20;
+constexpr size_t CLEANUP_BATCH_SIZE = 10;
 
 /**
- * @brief Module for incorporating georeferencing data (PoseStamped, Odometry, NavSatFix) into global optimization.
+ * @brief GNSS data structure for holding georeferenced positions
+ */
+struct GNSSData {
+    double timestamp;                // Timestamp in seconds
+    Eigen::Vector3d position;        // Position (x, y, z) in global frame
+    Eigen::Matrix3d covariance;      // Full position covariance matrix
+    int status;                      // Status/quality indicator (e.g., NavSatFix status)
+};
+
+/**
+ * @brief Custom factor that constrains the georeference position
+ */
+class GeoPositionFactor : public gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Pose3> {
+private:
+    Eigen::Vector3d measurement_;
+    
+public:
+    GeoPositionFactor(gtsam::Key key1, gtsam::Key key2, 
+                     const Eigen::Vector3d& measurement,
+                     const gtsam::SharedNoiseModel& model);
+                     
+    gtsam::Vector evaluateError(const gtsam::Pose3& T_pose, const gtsam::Pose3& X_pose,
+                              boost::optional<gtsam::Matrix&> H1 = boost::none,
+                              boost::optional<gtsam::Matrix&> H2 = boost::none) const override;
+};
+
+/**
+ * @brief Module for integrating georeferencing data into the mapping framework
+ * 
+ * This module accepts various types of georeferencing inputs (PoseStamped, Odometry, NavSatFix)
+ * and creates constraints for the global optimization to align the map with a global reference frame.
  */
 class Georeference : public ExtensionModuleBase {
 public:
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-  Georeference() : logger(create_module_logger("georeference")) {
-    logger_->info("initializing georeference module");
-    const std::string config_path = glim::GlobalConfigExt::get_config_path("config_georeference");
-    logger_->info("georeference_config_path={}", config_path);
+    /**
+     * @brief Constructor
+     */
+    Georeference();
+    
+    /**
+     * @brief Destructor
+     */
+    ~Georeference();
 
-    glim::Config config(config_path);
-    input_topic_ = config.param<std::string>("georeference", "input_topic", "/georeference_input");
-    input_type_ = config.param<std::string>("georeference", "input_type", "PoseStamped");  // PoseStamped, Odometry, NavSatFix
-    prior_inf_scale_ = config.param<Eigen::Vector3d>("georeference", "prior_inf_scale", Eigen::Vector3d(1e3, 1e3, 0.0));
-    min_baseline_ = config.param<double>("georeference", "min_baseline", 5.0);
-
-    transformation_initialized_ = false;
-    T_world_local_coord_.setIdentity();
-
-    kill_switch_ = false;
-    thread_ = std::thread([this] { backend_task(); });
-
-    using std::placeholders::_1;
-    using std::placeholders::_2;
-    using std::placeholders::_3;
-    GlobalMappingCallbacks::on_insert_submap.add(std::bind(&Georeference::on_insert_submap, this, _1));
-    GlobalMappingCallbacks::on_smoother_update.add(std::bind(&Georeference::on_smoother_update, this, _1, _2, _3));
-    GlobalMappingCallbacks::on_smoother_update_result.add(std::bind(&Georeference::on_smoother_update_result, this, _1));
-  }
-  ~Georeference() {
-    kill_switch_ = true;
-    thread_.join();
-  }
-
-  virtual std::vector<GenericTopicSubscription::Ptr> create_subscriptions() override {
-    std::vector<GenericTopicSubscription::Ptr> subs;
-    if (input_type_ == "PoseStamped") {
-      subs.push_back(std::make_shared<TopicSubscription<PoseStamped>>(input_topic_, [this](const PoseStampedConstPtr msg) { georeference_callback(msg); }));
-    } else if (input_type_ == "Odometry") {
-      subs.push_back(std::make_shared<TopicSubscription<Odometry>>(input_topic_, [this](const OdometryConstPtr msg) { georeference_callback(msg); }));
-    } else if (input_type_ == "NavSatFix") {
-      subs.push_back(std::make_shared<TopicSubscription<NavSatFix>>(input_topic_, [this](const NavSatFixConstPtr msg) { georeference_callback(msg); }));
-    } else {
-      logger_->error("Unknown georeference input_type_: {}", input_type_);
-    }
-    return subs;
-  }
-
-  void georeference_callback(const PoseStampedConstPtr& msg) {
-    Eigen::Vector4d data;
-    const double stamp = to_sec(msg->header.stamp);
-    const auto& pos = msg->pose.position;
-    data << stamp, pos.x, pos.y, pos.z;
-    input_coord_queue_.push_back(data);
-  }
-
-  void georeference_callback(const OdometryConstPtr& msg) {
-    Eigen::Vector4d data;
-    const double stamp = to_sec(msg->header.stamp);
-    const auto& pos = msg->pose.pose.position;
-    data << stamp, pos.x, pos.y, pos.z;
-    input_coord_queue_.push_back(data);
-  }
-
-  void georeference_callback(const NavSatFixConstPtr& msg) {
-    Eigen::Vector4d data;
-    const double stamp = to_sec(msg->header.stamp);
-    const Eigen::Vector3d ecef = wgs84_to_ecef(msg->latitude, msg->longitude, msg->altitude);
-    data << stamp, ecef.x(), ecef.y(), ecef.z();
-    input_coord_queue_.push_back(data);
-  }
-
-  void on_insert_submap(const SubMap::ConstPtr& submap) { input_submap_queue_.push_back(submap); }
-
-  void on_smoother_update(gtsam_points::ISAM2Ext& isam2, gtsam::NonlinearFactorGraph& new_factors, gtsam::Values& new_values) {
-    if (!isam2.valueExists(T(0))) {
-      // insert T_geo_world variable
-      new_values.insert(T(0), gtsam::Pose3::Identity());
-    }
-
-    static bool first_factors = true;
-    if (first_factors) {
-      if (output_factors__.size() < 10) {
-        // wait until we have enough factors to prevent underconstrained system
-        return;
-      }
-      first_factors = false;
-    }
-
-    const auto factors = output_factors__.get_all_and_clear();
-    if (!factors.empty()) {
-      logger_->debug("insert {} georeferencing prior factors", factors.size());
-      new_factors.add(factors);
-    }
-  }
-
-  void on_smoother_update_result(gtsam_points::ISAM2Ext& isam2) {
-    T_geo_world_ = Eigen::Isometry3d(isam2.calculateEstimate<gtsam::Pose3>(T(0)).matrix());
-    logger_->info("estimated T_geo_world={}", convert_to_string(T_geo_world_));
-  }
-
-  void backend_task() {
-    logger_->info("starting georeference backend thread");
-    std::deque<Eigen::Vector4d> coord_queue;  // Stores [stamp, x, y, z]
-    std::deque<SubMap::ConstPtr> submap_queue;
-
-    while (!kill_switch_) {
-      // Get new coordinate data
-      const auto coord_data = input_coord_queue_.get_all_and_clear();
-      coord_queue.insert(coord_queue.end(), coord_data.begin(), coord_data.end());
-
-      // Add new submaps
-      const auto new_submaps = input_submap_queue_.get_all_and_clear();
-      if (new_submaps.empty()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        continue;
-      }
-      submap_queue.insert(submap_queue.end(), new_submaps.begin(), new_submaps.end());
-
-      // Remove submaps that are created earlier than the oldest coordinate data
-      while (!coord_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp < coord_queue.front()[0]) {
-        submap_queue.pop_front();
-      }
-
-      // Interpolate coordinate data and associate with submaps
-      while (!coord_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp > coord_queue.front()[0] &&
-             submap_queue.front()->frames.back()->stamp < coord_queue.back()[0]) {
-        const auto& submap = submap_queue.front();
-        const double stamp = submap->frames[submap->frames.size() / 2]->stamp;
-
-        const auto right = std::lower_bound(coord_queue.begin(), coord_queue.end(), stamp, [](const Eigen::Vector4d& coord, const double t) { return coord[0] < t; });
-        if (right == coord_queue.end() || (right + 1) == coord_queue.end()) {
-          logger_->warn("invalid condition in georeference module!!");
-          break;
-        }
-        const auto left = right - 1;
-        logger_->debug("submap={:.6f} coord_left={:.6f} coord_right={:.6f}", stamp, (*left)[0], (*right)[0]);
-
-        const double tl = (*left)[0];
-        const double tr = (*right)[0];
-        const double p = (stamp - tl) / (tr - tl);
-        const Eigen::Vector4d interpolated = (1.0 - p) * (*left) + p * (*right);
-
-        submaps_.push_back(submap);
-        submap_coords_.push_back(interpolated);
-
-        submap_queue.pop_front();
-        coord_queue.erase(coord_queue.begin(), left);
-      }
-
-      // Initialize T_world_local_coord
-      if (!transformation_initialized_ && !submaps.empty() && (submaps.front()->T_world_origin.inverse() * submaps_.back()->T_world_origin).translation().norm() > min_baseline_) {
-        Eigen::Vector3d mean_est = Eigen::Vector3d::Zero();
-        Eigen::Vector3d mean_coord = Eigen::Vector3d::Zero();
-        for (int i = 0; i < submaps_.size(); i++) {
-          mean_est += submaps_[i]->T_world_origin.translation();
-          mean_coord += submap_coords_[i].tail<3>();
-        }
-        mean_est /= submaps_.size();
-        mean_coord /= submaps_.size();
-
-        Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-        for (int i = 0; i < submaps_.size(); i++) {
-          const Eigen::Vector3d centered_est = submaps_[i]->T_world_origin.translation() - mean_est;
-          const Eigen::Vector3d centered_coord = submap_coords_[i].tail<3>() - mean_coord;
-          cov += centered_coord * centered_est.transpose();
-        }
-        cov /= submaps_.size();
-
-        const Eigen::JacobiSVD<Eigen::Matrix2d> svd(cov.block<2, 2>(0, 0), Eigen::ComputeFullU | Eigen::ComputeFullV);
-        const Eigen::Matrix2d U = svd.matrixU();
-        const Eigen::Matrix2d V = svd.matrixV();
-        const Eigen::Matrix2d D = svd.singularValues().asDiagonal();
-        Eigen::Matrix2d S = Eigen::Matrix2d::Identity();
-
-        const double det = U.determinant() * V.determinant();
-        if (det < 0.0) {
-          S(1, 1) = -1;
-        }
-
-        Eigen::Isometry3d T_local_coord_world = Eigen::Isometry3d::Identity();
-        T_local_coord_world.linear().block<2, 2>(0, 0) = U * S * V.transpose();
-        T_local_coord_world.translation() = mean_coord - T_local_coord_world.linear() * mean_est;
-
-        T_world_local_coord_ = T_local_coord_world.inverse();
-
-        for (int i = 0; i < submaps_.size(); i++) {
-          const Eigen::Vector3d coord_in_world = T_world_local_coord_ * submap_coords_[i].tail<3>();
-          logger_->debug("submap={} coord_in_world={}", convert_to_string(submaps[i]->T_world_origin.translation().eval()), convert_to_string(coord_in_world));
-        }
-
-        logger_->info("T_world_local_coord={}", convert_to_string(T_world_local_coord_));
-        transformation_initialized_ = true;
-      }
-
-      // Add translation prior factor
-      if (!submap_coords.empty() && !submaps.empty()) {
-        const auto& submap = submaps.back();
-        const auto& coords = submap_coords.back();
-
-        // Create a GNSSData structure to hold the interpolated data
-        GNSSData interpolated = {
-          .stamp = coords[0],
-          .pos = coords.tail<3>(),
-          // You'll need to create a covariance matrix - using prior_inf_scale for now
-          .cov = (Eigen::Vector3d(1.0, 1.0, 1.0).array() / prior_inf_scale.array()).matrix()};
-
-        // Create expressions for the transformation
-        gtsam::Expression<gtsam::Pose3> T_geo_world(T(0));
-        gtsam::Expression<gtsam::Pose3> world_pose(X(submap->id));
-        auto geo_p = gtsam::translation(T_geo_world * world_pose);
-
-        // Add GNSS measurement factor
-        logger->info(
-          "Add Georeferencing factor between submap={} and gnss={}",
-          convert_to_string(submap->T_world_origin.translation().eval()),
-          convert_to_string(interpolated.pos));
-
-        auto noise_model = gtsam::noiseModel::Diagonal::Variances(interpolated.cov);
-        gtsam::NonlinearFactor::shared_ptr factor(new gtsam::ExpressionFactor<gtsam::Point3>(noise_model, interpolated.pos, geo_p));
-        output_factors_.push_back(factor);
-      }
-    }
-  }
+    /**
+     * @brief Create ROS topic subscriptions based on configuration
+     * @return Vector of topic subscription objects
+     */
+    virtual std::vector<GenericTopicSubscription::Ptr> create_subscriptions() override;
 
 private:
-  std::atomic_bool kill_switch_;
-  std::thread thread_;
+    /**
+     * @brief Handle PoseStamped message callback
+     * @param msg Incoming PoseStamped message
+     */
+    void handle_pose_stamped(const PoseStampedConstPtr& msg);
+    
+    /**
+     * @brief Handle Odometry message callback
+     * @param msg Incoming Odometry message
+     */
+    void handle_odometry(const OdometryConstPtr& msg);
+    
+    /**
+     * @brief Handle NavSatFix message callback
+     * @param msg Incoming NavSatFix message
+     */
+    void handle_nav_sat_fix(const NavSatFixConstPtr& msg);
+    
+    /**
+     * @brief Callback when a new submap is inserted
+     * @param submap Pointer to the new submap
+     */
+    void on_insert_submap(const SubMap::ConstPtr& submap);
+    
+    /**
+     * @brief Callback before global optimization update
+     * @param isam2 ISAM2 optimizer
+     * @param new_factors New factors to be added
+     * @param new_values New values to be added
+     */
+    void on_smoother_update(
+        gtsam_points::ISAM2Ext& isam2,
+        gtsam::NonlinearFactorGraph& new_factors,
+        gtsam::Values& new_values);
+    
+    /**
+     * @brief Callback after global optimization update
+     * @param isam2 ISAM2 optimizer with updated values
+     */
+    void on_smoother_update_result(gtsam_points::ISAM2Ext& isam2);
+    
+    /**
+     * @brief Background thread for processing data
+     */
+    void process_data_thread();
+    
+    /**
+     * @brief Process new incoming GNSS and submap data
+     * @param local_gnss_data_queue Queue of GNSS data to process
+     * @param local_submap_queue Queue of submaps to process
+     * @return True if new data was processed
+     */
+    bool process_new_data(std::deque<GNSSData>& local_gnss_data_queue, 
+                          std::deque<SubMap::ConstPtr>& local_submap_queue);
+    
+    /**
+     * @brief Match submaps with their best corresponding GNSS data
+     * @param local_gnss_data_queue Queue of available GNSS data
+     * @param local_submap_queue Queue of submaps to match
+     */
+    void match_submaps_with_gnss(std::deque<GNSSData>& local_gnss_data_queue,
+                                std::deque<SubMap::ConstPtr>& local_submap_queue);
+    
+    /**
+     * @brief Add georeference factors for matched submap-GNSS pairs
+     */
+    void add_factors_for_matched_data();
+    
+    /**
+     * @brief Find the best GNSS data point for a given submap
+     * @param submap The submap to find data for
+     * @param gnss_queue Queue of available GNSS data
+     * @param best_gnss Output parameter for the best matching GNSS data
+     * @return True if a suitable GNSS data point was found
+     */
+    bool find_best_gnss_for_submap(const SubMap::ConstPtr& submap, 
+                                  const std::deque<GNSSData>& gnss_queue,
+                                  GNSSData& best_gnss);
+    
+    /**
+     * @brief Create GNSS data structure from position and covariance
+     * @param timestamp Time of the measurement
+     * @param position Position vector
+     * @param covariance Covariance matrix
+     * @param status Status code (default 0)
+     * @return Constructed GNSS data object
+     */
+    GNSSData create_gnss_data(double timestamp, const Eigen::Vector3d& position, 
+                             const Eigen::Matrix3d& covariance, int status = 0);
+    
+    /**
+     * @brief Initialize the transformation between local and global coordinates
+     * @return True if initialization successful, false otherwise
+     */
+    bool initialize_transformation();
+    
+    /**
+     * @brief Predict position based on recent measurements
+     * @return Predicted position in world frame
+     */
+    Eigen::Vector3d predict_position();
+    
+    /**
+     * @brief Scale the covariance matrix based on configuration
+     * @param covariance Original covariance matrix
+     * @return Scaled covariance matrix
+     */
+    Eigen::Matrix3d scale_covariance(const Eigen::Matrix3d& covariance);
+    
+    /**
+     * @brief Ensure the covariance matrix is valid (positive definite with reasonable values)
+     * @param covariance Input covariance matrix
+     * @return Regularized covariance matrix
+     */
+    Eigen::Matrix3d regularize_covariance(const Eigen::Matrix3d& covariance);
+    
+    /**
+     * @brief Scales and regularizes the covariance matrix for numerical stability
+     * 
+     * First applies the user-configured scaling factor, then ensures the matrix
+     * is positive definite with eigenvalues above the minimum threshold.
+     * 
+     * @param covariance Input covariance matrix
+     * @return Prepared covariance matrix
+     */
+    Eigen::Matrix3d prepare_covariance(const Eigen::Matrix3d& covariance);
+    
+    /**
+     * @brief Add a georeference factor to the optimization
+     * @param submap Submap to be constrained
+     * @param gnss_data GNSS data to constrain to
+     */
+    void add_georeference_factor(
+        const SubMap::ConstPtr& submap,
+        const GNSSData& gnss_data);
+        
+    /**
+     * @brief Sort a container by timestamp
+     * @tparam T Container element type (must have timestamp member)
+     * @param container Container to sort
+     */
+    template<typename T>
+    void sort_by_timestamp(std::deque<T>& container) {
+        std::sort(container.begin(), container.end(),
+                 [](const T& a, const T& b) { return a.timestamp < b.timestamp; });
+    }
 
-  ConcurrentVector<Eigen::Vector4d> input_coord_queue_;
-  ConcurrentVector<SubMap::ConstPtr> input_submap_queue_;
-  ConcurrentVector<gtsam::NonlinearFactor::shared_ptr> output_factors_;
+    // Thread management
+    std::atomic_bool should_terminate_;
+    std::thread processing_thread_;
 
-  std::vector<SubMap::ConstPtr> submaps_;
-  std::vector<Eigen::Vector4d> submap_coords_;
+    // Data queues
+    ConcurrentVector<GNSSData> raw_gnss_data_queue_;             // Queue for GNSS data with original covariance
+    ConcurrentVector<SubMap::ConstPtr> submap_queue_;
+    ConcurrentVector<gtsam::NonlinearFactor::shared_ptr> factor_queue_;
 
-  std::string input_topic_;
-  std::string input_type_;
-  Eigen::Vector3d prior_inf_scale_;
-  double min_baseline_;
+    // Processed data storage
+    std::vector<SubMap::ConstPtr> processed_submaps_;
+    std::deque<GNSSData> submap_best_gnss_data_;       // Stores the best GNSSData point for each processed submap
+    std::unordered_set<int> processed_submap_ids_;  // Track which submaps we've already processed
 
-  bool transformation_initialized_;
-  Eigen::Isometry3d T_world_local_coord_;
-  Eigen::Isometry3d T_geo_world_;
+    // Configuration parameters
+    std::string input_topic_;
+    std::string input_type_;
+    Eigen::Vector3d prior_inf_scale_;
+    double min_baseline_;
+    int min_init_factors_;                         // Minimum number of factors needed before initialization
+    
+    // Covariance handling parameters
+    double covariance_scale_;
+    double min_covariance_eigenvalue_;
+    double position_prediction_window_;
+    
+    // Frame transformation parameters
+    std::string lidar_frame_id_;
+    std::string gps_frame_id_;
+    Eigen::Isometry3d T_lidar_gps_;  // Transform from GPS frame to LiDAR frame
+    bool manual_transform_provided_ = false;
 
-  // Logging
-  std::shared_ptr<spdlog::logger> logger_;
+    // State tracking
+    bool transformation_initialized_;
+    bool first_factors_added_ = false;
+    Eigen::Isometry3d T_world_local_coord_;  // Transform from local coordinates to world frame
+    Eigen::Isometry3d T_geo_world_;          // Transform from world frame to geo frame
+
+    // Logging
+    std::shared_ptr<spdlog::logger> logger_;
 };
 
 }  // namespace glim
 
+// Module factory function
 extern "C" glim::ExtensionModule* create_extension_module() {
-  return new glim::GNSSGlobal();
+    return new glim::Georeference();
 }
