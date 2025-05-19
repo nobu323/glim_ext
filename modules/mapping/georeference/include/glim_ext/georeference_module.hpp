@@ -206,6 +206,20 @@ private:
     void add_factors_for_matched_data();
     
     /**
+     * @brief Find multiple spatially-distributed GNSS data points for a submap using a 2D grid-based approach
+     * @param submap The submap to find GNSS data for
+     * @param gnss_queue Queue of available GNSS data points
+     * @param grid_cell_size The size of each grid cell for spatial distribution (in meters)
+     * @param max_points Maximum number of points to return
+     * @return Vector of selected GNSS data points
+     */
+    std::vector<GNSSData> find_distributed_gnss_points(
+        const SubMap::ConstPtr& submap,
+        const std::deque<GNSSData>& gnss_queue,
+        double grid_cell_size,
+        int max_points);
+        
+    /**
      * @brief Find the best GNSS data point for a given submap
      * @param submap The submap to find data for
      * @param gnss_queue Queue of available GNSS data
@@ -309,6 +323,10 @@ private:
     double covariance_scale_;
     double min_covariance_eigenvalue_;
     double position_prediction_window_;
+    
+    // Grid-based point selection parameters
+    double grid_cell_size_;
+    int max_gnss_points_per_submap_;
     
     // Frame transformation parameters
     std::string lidar_frame_id_;

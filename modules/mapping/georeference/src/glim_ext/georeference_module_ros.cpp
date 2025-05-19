@@ -88,7 +88,6 @@ Georeference::Georeference()
     // Basic configuration
     input_topic_ = config.param<std::string>("georeference", "input_topic", "/georeference_input");
     input_type_ = config.param<std::string>("georeference", "input_type", "PoseStamped");
-    prior_inf_scale_ = config.param<Eigen::Vector3d>("georeference", "prior_inf_scale", Eigen::Vector3d(1e3, 1e3, 1e3));
     min_baseline_ = config.param<double>("georeference", "min_baseline", 5.0);
     min_init_factors_ = config.param<int>("georeference", "min_init_factors", 3);
     
@@ -97,10 +96,10 @@ Georeference::Georeference()
     min_covariance_eigenvalue_ = config.param<double>("georeference", "min_covariance_eigenvalue", 1e-3);
     position_prediction_window_ = config.param<double>("georeference", "position_prediction_window", 5.0);
     
-    // Frame transformation parameters
-    lidar_frame_id_ = config.param<std::string>("georeference", "lidar_frame_id", "lidar");
-    gps_frame_id_ = config.param<std::string>("georeference", "gps_frame_id", "gps");
+    // Grid-based point selection parameters
+    grid_cell_size_ = config.param<double>("georeference", "grid_cell_size", 2.0);
     
+
     // Default identity transform
     T_lidar_gps_.setIdentity();
     
@@ -302,7 +301,7 @@ void Georeference::on_smoother_update(
             for (const auto& key : factor->keys()) {
                 if (!isam2.valueExists(key)) {
                     all_keys_exist = false;
-                    logger_->warn("Skipping factor with non-existent key: {}", gtsam::symbolChr(key));
+                    logger_->debug("Skipping factor with non-existent key: {}", gtsam::symbolChr(key));
                     break;
                 }
             }
@@ -318,7 +317,7 @@ void Georeference::on_smoother_update(
                         filtered_factors.size(), factors.size() - filtered_factors.size());
             new_factors.add(filtered_factors);
         } else {
-            logger_->warn("No valid georeference factors to add (all keys missing)");
+            logger_->debug("No valid georeference factors to add (all keys missing)");
         }
     }
 }
@@ -507,11 +506,21 @@ bool Georeference::initialize_transformation() {
     return true;
 }
 
-bool Georeference::find_best_gnss_for_submap(
+/**
+ * Find multiple spatially-distributed GNSS data points for a submap using a 2D grid-based approach
+ * @param submap The submap to find GNSS data for
+ * @param gnss_queue Queue of available GNSS data points
+ * @param grid_cell_size The size of each grid cell for spatial distribution (in meters)
+ * @param max_points Maximum number of points to return
+ * @return Vector of selected GNSS data points
+ */
+std::vector<GNSSData> Georeference::find_distributed_gnss_points(
     const SubMap::ConstPtr& submap,
     const std::deque<GNSSData>& gnss_queue,
-    GNSSData& best_gnss) 
+    double grid_cell_size,
+    int max_points)
 {
+    // Get submap time window
     const auto& frames = submap->frames;
     const double submap_start_time = frames.front()->stamp;
     const double submap_end_time = frames.back()->stamp;
@@ -519,47 +528,138 @@ bool Georeference::find_best_gnss_for_submap(
     // Find candidate GNSS points within the submap's time window
     std::vector<GNSSData> candidates;
     for (const auto& gnss_data : gnss_queue) {
-        if (gnss_data.timestamp >= submap_start_time && gnss_data.timestamp <= submap_end_time) {
-            candidates.push_back(gnss_data);
+        if (gnss_data.timestamp >= submap_start_time && 
+            gnss_data.timestamp <= submap_end_time) {
+            // Add only candidates with valid covariance
+            if (gnss_data.covariance.allFinite() && 
+                gnss_data.covariance.trace() > MINIMUM_COVARIANCE_TRACE) {
+                candidates.push_back(gnss_data);
+            }
         }
+        // Early exit optimization
         if (gnss_data.timestamp > submap_end_time && !candidates.empty()) {
-            // Optimization: if GNSS data is sorted and we passed submap_end_time,
-            // and we already have candidates, no need to check further
             break;
         }
     }
 
     if (candidates.empty()) {
+        logger_->warn("No valid GNSS candidates found for submap {} (t=[{:.3f}-{:.3f}])",
+                   submap->id, submap_start_time, submap_end_time);
+        return {};
+    }
+    
+    // Step 1: Find bounding box of all candidate points (XY only)
+    double min_x = candidates[0].position.x();
+    double min_y = candidates[0].position.y();
+    double max_x = min_x;
+    double max_y = min_y;
+    
+    for (const auto& gnss : candidates) {
+        min_x = std::min(min_x, gnss.position.x());
+        min_y = std::min(min_y, gnss.position.y());
+        max_x = std::max(max_x, gnss.position.x());
+        max_y = std::max(max_y, gnss.position.y());
+    }
+    
+    // Step 2: Create a grid with cells of size grid_cell_size
+    // Add a small epsilon to avoid floating point division issues
+    const double epsilon = 1e-6;
+    
+    // Calculate grid dimensions (XY only)
+    int grid_width = static_cast<int>(std::ceil((max_x - min_x + epsilon) / grid_cell_size));
+    int grid_height = static_cast<int>(std::ceil((max_y - min_y + epsilon) / grid_cell_size));
+    
+    // Step 3: Assign each point to a grid cell and keep the best point per cell
+    // For 2D grid, we use a map with (x,y) grid coordinates as key
+    std::map<std::pair<int, int>, GNSSData> best_point_per_cell;
+    
+    for (const auto& gnss : candidates) {
+        // Calculate grid cell coordinates (2D only)
+        int grid_x = static_cast<int>((gnss.position.x() - min_x) / grid_cell_size);
+        int grid_y = static_cast<int>((gnss.position.y() - min_y) / grid_cell_size);
+        
+        auto cell_key = std::make_pair(grid_x, grid_y);
+        
+        // If cell is empty or this point has better quality than existing one
+        // (Lower covariance trace means higher precision)
+        if (best_point_per_cell.find(cell_key) == best_point_per_cell.end() ||
+            gnss.covariance.trace() < best_point_per_cell[cell_key].covariance.trace()) {
+            best_point_per_cell[cell_key] = gnss;
+        }
+    }
+    
+    // Step 4: Collect results from all occupied cells
+    std::vector<GNSSData> cell_points;
+    for (const auto& pair : best_point_per_cell) {
+        cell_points.push_back(pair.second);
+    }
+    
+    // Step 5: Sort by quality (lower trace = better precision)
+    std::sort(cell_points.begin(), cell_points.end(), 
+        [](const GNSSData& a, const GNSSData& b) {
+            return a.covariance.trace() < b.covariance.trace();
+        });
+    
+    // Step 6: Limit to max points if needed
+    if (cell_points.size() > static_cast<size_t>(max_points)) {
+        cell_points.resize(max_points);
+    }
+    
+    // Calculate and log distribution metrics
+    if (cell_points.size() > 1) {
+        double total_distance = 0.0;
+        double min_distance = std::numeric_limits<double>::max();
+        double max_distance = 0.0;
+        int pair_count = 0;
+        
+        for (size_t i = 0; i < cell_points.size(); ++i) {
+            for (size_t j = i + 1; j < cell_points.size(); ++j) {
+                // Calculate XY distance only
+                double dx = cell_points[i].position.x() - cell_points[j].position.x();
+                double dy = cell_points[i].position.y() - cell_points[j].position.y();
+                double dist = std::sqrt(dx*dx + dy*dy);
+                
+                total_distance += dist;
+                min_distance = std::min(min_distance, dist);
+                max_distance = std::max(max_distance, dist);
+                pair_count++;
+            }
+        }
+        
+        double avg_distance = pair_count > 0 ? total_distance / pair_count : 0.0;
+        
+        logger_->info("GNSS XY-distribution for submap {}: points={}, avg_sep={:.2f}m, min={:.2f}m, max={:.2f}m", 
+                     submap->id, cell_points.size(), avg_distance, min_distance, max_distance);
+    }
+    
+    logger_->info("Selected {} spatially distributed GNSS points for submap {} from {} candidates across {} grid cells",
+                 cell_points.size(), submap->id, candidates.size(), best_point_per_cell.size());
+    
+    return cell_points;
+}
+
+/**
+ * Find the best GNSS data point for a given submap based on timestamps and covariance quality
+ * @param submap The submap to find GNSS data for
+ * @param gnss_queue Queue of available GNSS data points
+ * @param best_gnss Output parameter for the best matching GNSS data
+ * @return True if a suitable GNSS data point was found, false otherwise
+ */
+bool Georeference::find_best_gnss_for_submap(
+    const SubMap::ConstPtr& submap,
+    const std::deque<GNSSData>& gnss_queue,
+    GNSSData& best_gnss) 
+{
+    // Use the new grid-based approach, but only take the best point
+    std::vector<GNSSData> distributed_points = find_distributed_gnss_points(submap, gnss_queue, 2.0, 1);
+    
+    if (distributed_points.empty()) {
         return false;
     }
-
-    // Select the best candidate based on covariance trace
-    double min_trace = std::numeric_limits<double>::max();
-    bool found_best = false;
-
-    for (const auto& candidate : candidates) {
-        if (!candidate.covariance.allFinite()) {
-            logger_->warn("Invalid (non-finite) covariance matrix for candidate GNSS data at t={:.3f} for submap {}", 
-                         candidate.timestamp, submap->id);
-            continue;
-        }
-        
-        double trace = candidate.covariance.trace();
-        // Check for non-positive trace which indicates issues (e.g. zero covariance)
-        if (trace <= MINIMUM_COVARIANCE_TRACE) {
-            logger_->warn("Non-positive or near-zero trace ({:.3e}) for covariance matrix for candidate GNSS data at t={:.3f} for submap {}", 
-                         trace, candidate.timestamp, submap->id);
-            continue;
-        }
-        
-        if (trace < min_trace) {
-            min_trace = trace;
-            best_gnss = candidate;
-            found_best = true;
-        }
-    }
-
-    return found_best;
+    
+    // Take the first (and only) point
+    best_gnss = distributed_points[0];
+    return true;
 }
 
 void Georeference::add_georeference_factor(
@@ -685,15 +785,31 @@ void Georeference::match_submaps_with_gnss(
             continue;
         }
 
-        // Find the best GNSS data for this submap
-        GNSSData best_gnss_data;
-        if (find_best_gnss_for_submap(submap, local_gnss_data_queue, best_gnss_data)) {
-            processed_submaps_.push_back(submap);
-            submap_best_gnss_data_.push_back(best_gnss_data);
+        // Use the grid-based approach to find multiple spatially distributed GNSS points
+        // Get multiple points with 2.0m minimum spacing
+        std::vector<GNSSData> distributed_gnss_points = find_distributed_gnss_points(
+            submap, local_gnss_data_queue, 2.0, 5);
             
-            logger_->debug("Associated submap {} (t=[{:.3f}-{:.3f}]) with best GNSS data at t={:.3f} (cov_trace={:.4e})",
+        if (!distributed_gnss_points.empty()) {
+            processed_submaps_.push_back(submap);
+            
+            // Store all points for the submap
+            submap_best_gnss_data_.push_back(distributed_gnss_points[0]);
+            
+            // If we got multiple points, log more detailed info
+            if (distributed_gnss_points.size() > 1) {
+                logger_->info("Associated submap {} (t=[{:.3f}-{:.3f}]) with {} spatially distributed GNSS points",
+                          submap->id, submap_start_time, submap_end_time, distributed_gnss_points.size());
+            } else {
+                logger_->debug("Associated submap {} (t=[{:.3f}-{:.3f}]) with best GNSS data at t={:.3f} (cov_trace={:.4e})",
                           submap->id, submap_start_time, submap_end_time, 
-                          best_gnss_data.timestamp, best_gnss_data.covariance.trace());
+                          distributed_gnss_points[0].timestamp, distributed_gnss_points[0].covariance.trace());
+            }
+            
+            // Add georeference factors for all points
+            for (const auto& gnss_point : distributed_gnss_points) {
+                add_georeference_factor(submap, gnss_point);
+            }
             
             submap_iter = local_submap_queue.erase(submap_iter); // Remove processed submap and advance iterator
 
@@ -717,7 +833,7 @@ void Georeference::match_submaps_with_gnss(
                 }), q.end());
             }
         } else {
-            logger_->warn("Submap {} (t=[{:.3f}-{:.3f}]): No valid best GNSS candidate found. Discarding submap.",
+            logger_->warn("Submap {} (t=[{:.3f}-{:.3f}]): No valid GNSS candidates found. Discarding submap.",
                           submap->id, submap_start_time, submap_end_time);
             submap_iter = local_submap_queue.erase(submap_iter); // Remove submap and advance iterator
         }
@@ -725,7 +841,7 @@ void Georeference::match_submaps_with_gnss(
 }
 
 void Georeference::add_factors_for_matched_data() {
-    // First add factors for all matched data, regardless of initialization status
+    // First check for mismatch in data vectors
     if (processed_submaps_.size() != submap_best_gnss_data_.size()) {
         logger_->error(
             "Cannot add factors: mismatch between processed_submaps_ ({}) and submap_best_gnss_data_ ({}) sizes",
@@ -734,25 +850,7 @@ void Georeference::add_factors_for_matched_data() {
         return;
     }
     
-    bool factor_added_this_cycle = false;
-    for (size_t i = 0; i < processed_submaps_.size(); ++i) {
-        const auto& [submap, best_gnss] = std::make_pair(processed_submaps_[i], submap_best_gnss_data_[i]);
-
-        // Skip if factor already added for this submap
-        if (processed_submap_ids_.count(submap->id)) {
-            continue;
-        }
-
-        // Add factor using the best GNSS data (which includes its specific covariance)
-        add_georeference_factor(submap, best_gnss);
-        processed_submap_ids_.insert(submap->id);
-        factor_added_this_cycle = true;
-        
-        logger_->debug("Added georeference factor for submap {} using GNSS data at t={:.3f} with cov_trace={:.4e}",
-                      submap->id, best_gnss.timestamp, best_gnss.covariance.trace());
-    }
-    
-    // Then try to initialize transformation if needed and enough data exists
+    // Try to initialize transformation if needed and enough data exists
     if (!transformation_initialized_ && processed_submap_ids_.size() >= 2) {
         // Check if we have sufficient baseline distance
         if (!processed_submaps_.empty() && processed_submaps_.size() >= 2) {
