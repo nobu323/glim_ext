@@ -89,7 +89,6 @@ Georeference::Georeference()
     input_topic_ = config.param<std::string>("georeference", "input_topic", "/georeference_input");
     input_type_ = config.param<std::string>("georeference", "input_type", "PoseStamped");
     min_baseline_ = config.param<double>("georeference", "min_baseline", 5.0);
-    min_init_factors_ = config.param<int>("georeference", "min_init_factors", 3);
     
     // Covariance handling parameters
     covariance_scale_ = config.param<double>("georeference", "covariance_scale", 10.0);
