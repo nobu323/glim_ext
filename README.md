@@ -61,6 +61,9 @@ Example (`libflat_earther.so`):
 ### GNSS constraints (ROS2 only)
 - GNSS-based constraints for global optimization
 
+### Georeference (Tested ROS2, shooooould work ROS1?)
+- [More info here](modules/mapping/georeference/README.md)
+
 ### ScanContext Loop Detector
 - Explicit loop detection based on ScanContext
 - Dependency: [ScanContext](https://github.com/irapkaist/scancontext) (CC BY-NC-SA 4.0)
