@@ -13,7 +13,8 @@ option(ENABLE_GRAVITY "Enable Gravity estimation and correction module" ON)
 option(ENABLE_SCAN_CONTEXT "Enable ScanContext Loop Detector" OFF)
 option(ENABLE_DBOW "Enable DBoW Loop Detector" OFF)
 option(ENABLE_GNSS "Enable GNSS module (ROS1 is not supported)" ON)
-option(ENABLE_FLATEARTHER "Enable flat earth assumption module" ON)
+option(ENABLE_FLATEARTHER "Enable flat earth assumption module" OFF)
+option(ENABLE_GEOREFERENCE "Enable Georeference module" ON)
 
 #################
 ## ROS-related ##
@@ -44,8 +45,8 @@ target_compile_options(glim_ext PRIVATE
 list(APPEND glim_ext_LIBRARIES glim_ext)
 
 # Examples
-add_subdirectory(modules/example/glim_callback_demo)
-list(APPEND glim_ext_LIBRARIES glim_callback_demo)
+# add_subdirectory(modules/example/glim_callback_demo)
+# list(APPEND glim_ext_LIBRARIES glim_callback_demo)
 
 # Odometry estimation modules
 if(ENABLE_ORBSLAM)
@@ -72,6 +73,11 @@ endif()
 if(ENABLE_SCAN_CONTEXT)
   add_subdirectory(modules/mapping/scan_context_loop_detector)
   list(APPEND glim_ext_LIBRARIES scan_context_loop_detector)
+endif()
+
+if(ENABLE_GEOREFERENCE)
+  add_subdirectory(modules/mapping/georeference)
+  list(APPEND glim_ext_LIBRARIES georeference)
 endif()
 
 if(ENABLE_DBOW)
