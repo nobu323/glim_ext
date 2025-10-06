@@ -1,0 +1,28 @@
+services:
+  glim_ros2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ros2
+    container_name: glim_ros2_container
+    network_mode: host
+    ipc: host
+    pid: host
+    privileged: true             # ホストのシリアルポートをコンテナに持ってくる
+    environment:
+      - DISPLAY=${DISPLAY}
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix                          # 画面出力用
+      - ~/.Xauthority:/root/.Xauthority      # 画面出力用
+      - ~/workspace/01-musakosu/Cub_ROS/ros/cub_bringup/params/glim_params:/glim/config:r # glimパラメータ取り込み用
+      - ~/workspace/01-musakosu/Cub_ROS/rosbag:/data/rosbags:r   # rosbag data読み込み用
+      - ./src/cub_description:/root/ros2_ws/src/cub_description  # base_link生成用
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true

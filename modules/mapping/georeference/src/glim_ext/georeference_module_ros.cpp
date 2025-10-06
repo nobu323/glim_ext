@@ -22,8 +22,8 @@ GeoPositionFactor::GeoPositionFactor(gtsam::Key key1, gtsam::Key key2,
       
 gtsam::Vector GeoPositionFactor::evaluateError(
     const gtsam::Pose3& T_pose, const gtsam::Pose3& X_pose,
-    boost::optional<gtsam::Matrix&> H1, 
-    boost::optional<gtsam::Matrix&> H2) const 
+    gtsam::OptionalMatrixType H1, 
+    gtsam::OptionalMatrixType H2) const 
 {
     // Compose the two poses: T * X
     gtsam::Pose3 composed = T_pose.compose(X_pose);

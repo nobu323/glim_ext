@@ -1,0 +1,6 @@
+{
+    "georeference": {
+    "input_topic": "fix",
+    "input_type": "NavSatFix"
+    }
+}

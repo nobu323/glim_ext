@@ -106,8 +106,8 @@ public:
                      const gtsam::SharedNoiseModel& model);
                      
     gtsam::Vector evaluateError(const gtsam::Pose3& T_pose, const gtsam::Pose3& X_pose,
-                              boost::optional<gtsam::Matrix&> H1 = boost::none,
-                              boost::optional<gtsam::Matrix&> H2 = boost::none) const override;
+                              gtsam::OptionalMatrixType H1 = nullptr,
+                              gtsam::OptionalMatrixType H2 = nullptr) const override;
 };
 
 /**
