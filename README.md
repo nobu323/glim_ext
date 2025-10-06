@@ -64,6 +64,47 @@ Example (`libflat_earther.so`):
 ### Georeference (Tested ROS2, shooooould work ROS1?)
 - [More info here](modules/mapping/georeference/README.md)
 
+#### 実行方法 (Docker)
+
+1.  Docker Composeを起動します。
+    ```bash
+    docker-compose up -d
+    ```
+
+2.  起動したコンテナにアタッチします。
+    ```bash
+    docker-compose exec glim_ros2_container bash
+    ```
+
+3.  コンテナ内で`glim_ros`を実行します。
+
+    必要に応じて、`base_link`を追加するために別のターミナルで`cub_description`を起動してください。
+    ```bash
+    ros2 launch cub_description display.launch.py
+    ```
+
+    その後、`glim`を起動します。
+    - **ros2 run を使用する場合:** `{bagファイル名}`は実際のファイル名に置き換えてください。
+        ```bash
+        ros2 run glim_ros glim_rosbag {bagファイル名} --ros-args -p config_path:=/glim/config
+        ```
+
+#### 設定
+
+1.  `config/georeference.json`内の設定値を、利用する環境に合わせて適宜調整してください。
+
+2.  `glim`本体の`config_ros.json`にある`extension_modules`に、`libgeoreference.so`を追加します。
+
+    ```json
+    "extension_modules": [
+        "libmemory_monitor.so",
+        "libstandard_viewer.so",
+        "librviz_viewer.so",
+        "libgeoreference.so"
+      ],
+    ```
+
+
 ### ScanContext Loop Detector
 - Explicit loop detection based on ScanContext
 - Dependency: [ScanContext](https://github.com/irapkaist/scancontext) (CC BY-NC-SA 4.0)
